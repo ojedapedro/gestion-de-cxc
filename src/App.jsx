@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { initialDb } from './data/initialDb';
 import Dashboard from './components/Dashboard';
 import CajaBancos from './components/CajaBancos';
@@ -8,148 +8,374 @@ import VentasTienda from './components/VentasTienda';
 import Recibos from './components/Recibos';
 import Reportes from './components/Reportes';
 
+// Firebase Services & Utilities
+import { 
+  db, 
+  isFirebaseConfigured, 
+  saveDocument, 
+  deleteDocument, 
+  seedCollectionIfEmpty 
+} from './services/firebase';
+import { collection, onSnapshot } from 'firebase/firestore';
+
 function App() {
   const [activeView, setActiveView] = useState('dashboard');
-  const [vendedores, setVendedores] = useState([]);
-  const [ventas, setVentas] = useState([]);
-  const [creditos, setCreditos] = useState([]);
-  const [abonos, setAbonos] = useState([]);
-  const [egresos, setEgresos] = useState([]);
-  const [tasas, setTasas] = useState({
+  
+  // Real Local States
+  const [vendedores, setVendedoresState] = useState([]);
+  const [ventas, setVentasState] = useState([]);
+  const [creditos, setCreditosState] = useState([]);
+  const [abonos, setAbonosState] = useState([]);
+  const [egresos, setEgresosState] = useState([]);
+  const [transfers, setTransfersState] = useState([]);
+  const [tasas, setTasasState] = useState({
     bcv: 523.67,
     euro: 609.34,
     binance: 712.74,
   });
 
-  // State to handle transfer drawer
-  const [transfers, setTransfers] = useState([]);
+  const isFirebaseMode = isFirebaseConfigured();
 
-  // Initialize State
+  // Ref to always hold the latest state values to avoid React stale closures in handlers
+  const stateRef = useRef({ vendedores, ventas, creditos, abonos, egresos, transfers, tasas });
   useEffect(() => {
-    const storedVendedores = localStorage.getItem('cxc_vendedores');
-    const storedVentas = localStorage.getItem('cxc_ventas');
-    const storedCreditos = localStorage.getItem('cxc_creditos');
-    const storedAbonos = localStorage.getItem('cxc_abonos');
-    const storedEgresos = localStorage.getItem('cxc_egresos');
-    const storedTasas = localStorage.getItem('cxc_tasas');
-    const storedTransfers = localStorage.getItem('cxc_transfers');
+    stateRef.current = { vendedores, ventas, creditos, abonos, egresos, transfers, tasas };
+  }, [vendedores, ventas, creditos, abonos, egresos, transfers, tasas]);
 
-    if (storedVendedores && storedVentas && storedCreditos && storedAbonos && storedEgresos) {
-      setVendedores(JSON.parse(storedVendedores));
-      setVentas(JSON.parse(storedVentas));
-      setCreditos(JSON.parse(storedCreditos));
-      setAbonos(JSON.parse(storedAbonos));
-      setEgresos(JSON.parse(storedEgresos));
-      if (storedTasas) setTasas(JSON.parse(storedTasas));
-      if (storedTransfers) setTransfers(JSON.parse(storedTransfers));
+  // Helper to create state setters that synchronize with Firestore in real-time or fallback locally
+  const createFirebaseSyncSetter = (collectionName, localSetter) => {
+    return async (updatedVal) => {
+      const currentState = stateRef.current[collectionName];
+      const newList = typeof updatedVal === 'function' ? updatedVal(currentState) : updatedVal;
+      
+      // Update local state immediately for instant optimistic UI
+      localSetter(newList);
+
+      if (isFirebaseMode && db) {
+        try {
+          // Identify added or modified items
+          const addedOrModified = newList.filter(newItem => {
+            const oldItem = currentState.find(item => item.id === newItem.id);
+            return !oldItem || JSON.stringify(oldItem) !== JSON.stringify(newItem);
+          });
+
+          // Identify deleted items
+          const deleted = currentState.filter(oldItem => !newList.some(newItem => newItem.id === oldItem.id));
+
+          // Save added or modified to Firestore
+          for (const item of addedOrModified) {
+            await saveDocument(collectionName, item);
+          }
+
+          // Delete from Firestore
+          for (const item of deleted) {
+            await deleteDocument(collectionName, item.id);
+          }
+        } catch (err) {
+          console.error(`Error syncing state to Firestore for ${collectionName}:`, err);
+        }
+      } else {
+        // LocalStorage fallback
+        localStorage.setItem(`cxc_${collectionName}`, JSON.stringify(newList));
+      }
+    };
+  };
+
+  // Wrapped Sync Setters matching original signatures
+  const setVendedores = createFirebaseSyncSetter('vendedores', setVendedoresState);
+  const setVentas = createFirebaseSyncSetter('ventas', setVentasState);
+  const setCreditos = createFirebaseSyncSetter('creditos', setCreditosState);
+  const setAbonos = createFirebaseSyncSetter('abonos', setAbonosState);
+  const setEgresos = createFirebaseSyncSetter('egresos', setEgresosState);
+  const setTransfers = createFirebaseSyncSetter('transfers', setTransfersState);
+
+  const setTasas = async (updatedVal) => {
+    const newTasas = typeof updatedVal === 'function' ? updatedVal(tasas) : updatedVal;
+    setTasasState(newTasas);
+    if (isFirebaseMode && db) {
+      try {
+        await saveDocument('config', { id: 'tasas', ...newTasas });
+      } catch (err) {
+        console.error('Error saving tasas to Firestore:', err);
+      }
     } else {
-      // Retrospective Account Assignment for Historical Data
-      // Sellers
-      const initialSellers = initialDb.meta.vendedores.map(name => ({
-        id: name.toLowerCase().replace(/\s+/g, '_'),
-        nombre: name,
-        fechaCreado: '2026-05-07',
-      }));
-      setVendedores(initialSellers);
+      localStorage.setItem('cxc_tasas', JSON.stringify(newTasas));
+    }
+  };
 
-      // Store Wendy Sales
-      const initialVentas = initialDb.ventas_store.map((v, idx) => ({
-        id: `venta_h_${idx}`,
-        fecha: v.fecha,
-        semana: v.semana,
-        bolivares: v.bolivares,
-        tasa: v.tasa,
-        efectivo_usd: v.efectivo_usd,
-        zelle: v.zelle,
-        cxc: v.cxc,
-        venta_diaria: v.venta_diaria,
-        venta_real_tienda: v.venta_real_tienda,
-        cuenta_bs: 'banco_bs',  // Historic store Bs went to Bank
-        cuenta_usd: v.zelle > 0 ? 'banco_usd' : 'caja_usd',
-      }));
-      setVentas(initialVentas);
+  // Initialize and Sync State with Firebase Firestore (or LocalStorage fallback)
+  useEffect(() => {
+    if (isFirebaseMode && db) {
+      // 1. Define Seeding Logic
+      const checkAndSeedDatabase = async () => {
+        // Vendedores
+        const initialSellers = initialDb.meta.vendedores.map(name => ({
+          id: name.toLowerCase().replace(/\s+/g, '_'),
+          nombre: name,
+          fechaCreado: '2026-05-07',
+        }));
 
-      // Credits (CxC Notes)
-      const initialCreditos = initialDb.cxc_notes.map((c, idx) => ({
-        id: `credito_h_${idx}`,
-        nota: c.nota,
-        fecha: c.fecha,
-        cliente_vendedor: c.cliente_vendedor,
-        monto: c.monto,
-        total_nota: c.total_nota,
-        estado: 'pendiente', // Will compute dynamically
-      }));
-      setCreditos(initialCreditos);
+        // Wendy Store Sales
+        const initialVentas = initialDb.ventas_store.map((v, idx) => ({
+          id: `venta_h_${idx}`,
+          fecha: v.fecha,
+          semana: v.semana,
+          bolivares: v.bolivares,
+          tasa: v.tasa,
+          efectivo_usd: v.efectivo_usd,
+          zelle: v.zelle,
+          cxc: v.cxc,
+          venta_diaria: v.venta_diaria,
+          venta_real_tienda: v.venta_real_tienda,
+          cuenta_bs: 'banco_bs',
+          cuenta_usd: v.zelle > 0 ? 'banco_usd' : 'caja_usd',
+        }));
 
-      // Abonos (Payments)
-      const initialAbonos = initialDb.abonos.map((a, idx) => {
-        let cuenta_destino = 'caja_usd';
-        if (a.zelle > 0) {
-          cuenta_destino = 'banco_usd';
-        } else if (a.bolivares > 0) {
-          cuenta_destino = 'banco_bs';
+        // Credits (CxC Notes)
+        const initialCreditos = initialDb.cxc_notes.map((c, idx) => ({
+          id: `credito_h_${idx}`,
+          nota: c.nota,
+          fecha: c.fecha,
+          cliente_vendedor: c.cliente_vendedor,
+          monto: c.monto,
+          total_nota: c.total_nota,
+          estado: 'pendiente',
+        }));
+
+        // Abonos (Payments)
+        const initialAbonos = initialDb.abonos.map((a, idx) => {
+          let cuenta_destino = 'caja_usd';
+          if (a.zelle > 0) {
+            cuenta_destino = 'banco_usd';
+          } else if (a.bolivares > 0) {
+            cuenta_destino = 'banco_bs';
+          }
+          return {
+            id: `abono_h_${idx}`,
+            vendedor: a.vendedor,
+            fecha: a.fecha,
+            bolivares: a.bolivares,
+            tasa: a.tasa,
+            usd_conv: a.usd_conv,
+            efectivo_usd: a.efectivo_usd,
+            zelle: a.zelle,
+            monto_total_usd: a.monto_total_usd,
+            cuenta: cuenta_destino,
+          };
+        });
+
+        // Egresos (Expenses)
+        const initialEgresos = initialDb.expenses.map((e, idx) => {
+          let cuenta_origen = 'caja_usd';
+          const det = e.detalle.toLowerCase();
+          if (e.bolivares > 0) {
+            cuenta_origen = 'banco_bs';
+          } else if (det.includes('zelle')) {
+            cuenta_origen = 'banco_usd';
+          }
+          return {
+            id: `gasto_h_${idx}`,
+            fecha: e.fecha,
+            nota: e.nota,
+            bolivares: e.bolivares,
+            dolares: e.dolares,
+            detalle: e.detalle,
+            cuenta: cuenta_origen,
+          };
+        });
+
+        // Run seeds
+        await seedCollectionIfEmpty('vendedores', initialSellers);
+        await seedCollectionIfEmpty('ventas', initialVentas);
+        await seedCollectionIfEmpty('creditos', initialCreditos);
+        await seedCollectionIfEmpty('abonos', initialAbonos);
+        await seedCollectionIfEmpty('egresos', initialEgresos);
+        
+        // Also seed initial tasas if configuration doesn't exist
+        try {
+          await seedCollectionIfEmpty('config', [{
+            id: 'tasas',
+            bcv: 523.67,
+            euro: 609.34,
+            binance: 712.74,
+          }]);
+        } catch (e) {
+          console.error("Error seeding config rates:", e);
         }
-        return {
-          id: `abono_h_${idx}`,
-          vendedor: a.vendedor,
-          fecha: a.fecha,
-          bolivares: a.bolivares,
-          tasa: a.tasa,
-          usd_conv: a.usd_conv,
-          efectivo_usd: a.efectivo_usd,
-          zelle: a.zelle,
-          monto_total_usd: a.monto_total_usd,
-          cuenta: cuenta_destino,
-        };
-      });
-      setAbonos(initialAbonos);
+      };
 
-      // Egresos (Expenses)
-      const initialEgresos = initialDb.expenses.map((e, idx) => {
-        let cuenta_origen = 'caja_usd';
-        const det = e.detalle.toLowerCase();
-        if (e.bolivares > 0) {
-          cuenta_origen = 'banco_bs';
-        } else if (det.includes('zelle')) {
-          cuenta_origen = 'banco_usd';
+      checkAndSeedDatabase();
+
+      // 2. Set up real-time listeners for each collection
+      const unsubs = [];
+
+      // Sort helpers
+      const sortByIdOrItem = (a, b) => (b.item || 0) - (a.item || 0);
+
+      // Listen to Vendedores
+      unsubs.push(onSnapshot(collection(db, 'vendedores'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort((a, b) => a.nombre.localeCompare(b.nombre));
+        setVendedoresState(list);
+      }));
+
+      // Listen to Ventas
+      unsubs.push(onSnapshot(collection(db, 'ventas'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort(sortByIdOrItem);
+        setVentasState(list);
+      }));
+
+      // Listen to Creditos
+      unsubs.push(onSnapshot(collection(db, 'creditos'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort(sortByIdOrItem);
+        setCreditosState(list);
+      }));
+
+      // Listen to Abonos
+      unsubs.push(onSnapshot(collection(db, 'abonos'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort(sortByIdOrItem);
+        setAbonosState(list);
+      }));
+
+      // Listen to Egresos
+      unsubs.push(onSnapshot(collection(db, 'egresos'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort(sortByIdOrItem);
+        setEgresosState(list);
+      }));
+
+      // Listen to Transfers
+      unsubs.push(onSnapshot(collection(db, 'transfers'), (snapshot) => {
+        const list = snapshot.docs.map(doc => doc.data());
+        list.sort(sortByIdOrItem);
+        setTransfersState(list);
+      }));
+
+      // Listen to Tasas
+      unsubs.push(onSnapshot(collection(db, 'config'), (snapshot) => {
+        const docObj = snapshot.docs.find(d => d.id === 'tasas');
+        if (docObj) {
+          const data = docObj.data();
+          setTasasState({
+            bcv: data.bcv,
+            euro: data.euro,
+            binance: data.binance
+          });
         }
-        return {
-          id: `gasto_h_${idx}`,
-          fecha: e.fecha,
-          nota: e.nota,
-          bolivares: e.bolivares,
-          dolares: e.dolares,
-          detalle: e.detalle,
-          cuenta: cuenta_origen,
-        };
-      });
-      setEgresos(initialEgresos);
+      }));
 
-      // Current rates
-      if (initialDb.exchange_rates.length > 0) {
-        const latest = initialDb.exchange_rates[0]; // BCV list
-        setTasas({
+      return () => {
+        unsubs.forEach(unsub => unsub());
+      };
+
+    } else {
+      // LocalStorage Fallback Initialization
+      const storedVendedores = localStorage.getItem('cxc_vendedores');
+      const storedVentas = localStorage.getItem('cxc_ventas');
+      const storedCreditos = localStorage.getItem('cxc_creditos');
+      const storedAbonos = localStorage.getItem('cxc_abonos');
+      const storedEgresos = localStorage.getItem('cxc_egresos');
+      const storedTasas = localStorage.getItem('cxc_tasas');
+      const storedTransfers = localStorage.getItem('cxc_transfers');
+
+      if (storedVendedores && storedVentas && storedCreditos && storedAbonos && storedEgresos) {
+        setVendedoresState(JSON.parse(storedVendedores));
+        setVentasState(JSON.parse(storedVentas));
+        setCreditosState(JSON.parse(storedCreditos));
+        setAbonosState(JSON.parse(storedAbonos));
+        setEgresosState(JSON.parse(storedEgresos));
+        if (storedTasas) setTasasState(JSON.parse(storedTasas));
+        if (storedTransfers) setTransfersState(JSON.parse(storedTransfers));
+      } else {
+        // Initial setup from initialDb.js
+        const initialSellers = initialDb.meta.vendedores.map(name => ({
+          id: name.toLowerCase().replace(/\s+/g, '_'),
+          nombre: name,
+          fechaCreado: '2026-05-07',
+        }));
+        setVendedoresState(initialSellers);
+
+        const initialVentas = initialDb.ventas_store.map((v, idx) => ({
+          id: `venta_h_${idx}`,
+          fecha: v.fecha,
+          semana: v.semana,
+          bolivares: v.bolivares,
+          tasa: v.tasa,
+          efectivo_usd: v.efectivo_usd,
+          zelle: v.zelle,
+          cxc: v.cxc,
+          venta_diaria: v.venta_diaria,
+          venta_real_tienda: v.venta_real_tienda,
+          cuenta_bs: 'banco_bs',
+          cuenta_usd: v.zelle > 0 ? 'banco_usd' : 'caja_usd',
+        }));
+        setVentasState(initialVentas);
+
+        const initialCreditos = initialDb.cxc_notes.map((c, idx) => ({
+          id: `credito_h_${idx}`,
+          nota: c.nota,
+          fecha: c.fecha,
+          cliente_vendedor: c.cliente_vendedor,
+          monto: c.monto,
+          total_nota: c.total_nota,
+          estado: 'pendiente',
+        }));
+        setCreditosState(initialCreditos);
+
+        const initialAbonos = initialDb.abonos.map((a, idx) => {
+          let cuenta_destino = 'caja_usd';
+          if (a.zelle > 0) {
+            cuenta_destino = 'banco_usd';
+          } else if (a.bolivares > 0) {
+            cuenta_destino = 'banco_bs';
+          }
+          return {
+            id: `abono_h_${idx}`,
+            vendedor: a.vendedor,
+            fecha: a.fecha,
+            bolivares: a.bolivares,
+            tasa: a.tasa,
+            usd_conv: a.usd_conv,
+            efectivo_usd: a.efectivo_usd,
+            zelle: a.zelle,
+            monto_total_usd: a.monto_total_usd,
+            cuenta: cuenta_destino,
+          };
+        });
+        setAbonosState(initialAbonos);
+
+        const initialEgresos = initialDb.expenses.map((e, idx) => {
+          let cuenta_origen = 'caja_usd';
+          const det = e.detalle.toLowerCase();
+          if (e.bolivares > 0) {
+            cuenta_origen = 'banco_bs';
+          } else if (det.includes('zelle')) {
+            cuenta_origen = 'banco_usd';
+          }
+          return {
+            id: `gasto_h_${idx}`,
+            fecha: e.fecha,
+            nota: e.nota,
+            bolivares: e.bolivares,
+            dolares: e.dolares,
+            detalle: e.detalle,
+            cuenta: cuenta_origen,
+          };
+        });
+        setEgresosState(initialEgresos);
+
+        setTransfersState([]);
+        setTasasState({
           bcv: 523.67,
           euro: 609.34,
           binance: 712.74,
         });
       }
-      setTransfers([]);
     }
-  }, []);
-
-  // Save changes to localStorage
-  useEffect(() => {
-    if (vendedores.length > 0) {
-      localStorage.setItem('cxc_vendedores', JSON.stringify(vendedores));
-      localStorage.setItem('cxc_ventas', JSON.stringify(ventas));
-      localStorage.setItem('cxc_creditos', JSON.stringify(creditos));
-      localStorage.setItem('cxc_abonos', JSON.stringify(abonos));
-      localStorage.setItem('cxc_egresos', JSON.stringify(egresos));
-      localStorage.setItem('cxc_tasas', JSON.stringify(tasas));
-      localStorage.setItem('cxc_transfers', JSON.stringify(transfers));
-    }
-  }, [vendedores, ventas, creditos, abonos, egresos, tasas, transfers]);
+  }, [isFirebaseMode]);
 
   // Calculations for CXC Balances
   // Calculate each salesperson's credits, abonos and pending debt
@@ -403,6 +629,31 @@ function App() {
         <div className="logo-container">
           <div className="logo-icon">C</div>
           <span className="logo-text">Gesti&oacute;n de CxC</span>
+        </div>
+
+        {/* Database Connection Status Banner */}
+        <div style={{ padding: '0.25rem 1rem 0.75rem 1rem' }}>
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: '0.5rem',
+            padding: '0.35rem 0.75rem',
+            borderRadius: '2rem',
+            fontSize: '0.72rem',
+            fontWeight: '600',
+            backgroundColor: isFirebaseMode ? 'rgba(16, 185, 129, 0.1)' : 'rgba(245, 158, 11, 0.1)',
+            color: isFirebaseMode ? '#10b981' : '#f59e0b',
+            border: `1px solid ${isFirebaseMode ? 'rgba(16, 185, 129, 0.2)' : 'rgba(245, 158, 11, 0.2)'}`,
+          }}>
+            <span style={{
+              width: '6px',
+              height: '6px',
+              borderRadius: '50%',
+              backgroundColor: isFirebaseMode ? '#10b981' : '#f59e0b',
+              boxShadow: isFirebaseMode ? '0 0 8px #10b981' : '0 0 8px #f59e0b',
+            }}></span>
+            {isFirebaseMode ? 'Sincronizado con Firebase' : 'Modo Local (Configurar .env)'}
+          </div>
         </div>
         
         <nav>
